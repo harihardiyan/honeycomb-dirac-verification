@@ -120,7 +120,7 @@ pip install jax jaxlib equinox
 Execute the monolithic script to generate a detailed physical report:
 
 ```bash
-python graphenediracaudit.py
+honeycomb_dirac_verification.py
 ```
 
 ### 📊 Example Output Snippet
