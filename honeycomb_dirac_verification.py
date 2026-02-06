@@ -1,3 +1,4 @@
+
 from jax import config
 config.update("jax_enable_x64", True)
 
@@ -181,22 +182,23 @@ def berry_phase_band_loop(model: GrapheneModel, K, radius_rel, dirs, band_index=
 
     def eigvec(k):
         _, v = jnp.linalg.eigh(model.h_k(k))
-        v0 = v[:, band_index]
-        phase_fix = jnp.angle(v0[0])
-        return v0 * jnp.exp(-1j * phase_fix)
+        v = v[:, band_index]
+        phase = jnp.angle(v[0])
+        v = v * jnp.exp(-1j * phase)
+        v = jnp.where(jnp.real(v[0]) < 0, -v, v)
+        return v
 
     vs = jax.vmap(eigvec)(ks)
 
     overlaps = jnp.sum(jnp.conj(vs[:-1]) * vs[1:], axis=1)
     dphi = jnp.angle(overlaps)
-    dphi = (dphi + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    berry = jnp.sum(dphi)
+    dphi = jnp.mod(dphi + jnp.pi, 2 * jnp.pi) - jnp.pi
 
     overlap_close = jnp.sum(jnp.conj(vs[-1]) * vs[0])
     dphi_close = jnp.angle(overlap_close)
-    dphi_close = (dphi_close + jnp.pi) % (2.0 * jnp.pi) - jnp.pi
-    berry += dphi_close
+    dphi_close = jnp.mod(dphi_close + jnp.pi, 2 * jnp.pi) - jnp.pi
 
+    berry = jnp.sum(dphi) + dphi_close
     return berry
 
 
