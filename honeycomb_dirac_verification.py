@@ -1,4 +1,3 @@
-
 from jax import config
 config.update("jax_enable_x64", True)
 
@@ -9,9 +8,9 @@ import equinox as eqx
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-
 # ============================================================
 #  Physical constants
+#  (yes, we typed these a thousand times in our lives)
 # ============================================================
 
 hbar = 1.054571817e-34
@@ -20,15 +19,16 @@ eV_to_J = 1.602176634e-19
 
 # ============================================================
 #  Configuration dataclasses
+#  Tiny knobs that we kept tweaking until things stopped lying
 # ============================================================
 
 @dataclass
 class GrapheneConfig:
     """Tight-binding parameters for a honeycomb lattice (graphene-like)."""
-    a: float = 2.46e-10
-    t_eV: float = 2.8
-    tprime_eV: float = 0.0
-    mass_eV: float = 0.0
+    a: float = 2.46e-10      # lattice constant (m)
+    t_eV: float = 2.8        # nearest-neighbor hopping (eV)
+    tprime_eV: float = 0.0   # next-nearest-neighbor hopping (eV)
+    mass_eV: float = 0.0     # sublattice mass term (eV)
 
 
 @dataclass
@@ -51,7 +51,9 @@ class CoreAuditConfig:
 
 @dataclass(frozen=True)
 class ReportAuditConfig:
-    """Tolerance and reporting thresholds for the audit."""
+    """Tolerance and reporting thresholds for the audit.
+    These are the lines we drew in the sand and refused to cross.
+    """
     periodicity_atol: float = 1e-12
     hermiticity_atol: float = 1e-12
     gauge_atol: float = 1e-12
@@ -69,6 +71,7 @@ REPORT_CFG = ReportAuditConfig()
 
 # ============================================================
 #  Graphene tight-binding model (C3-consistent)
+#  The core: simple Hamiltonian, endless debugging
 # ============================================================
 
 class GrapheneModel(eqx.Module):
@@ -88,28 +91,29 @@ class GrapheneModel(eqx.Module):
     massJ: float
 
     def __init__(self, cfg: GrapheneConfig):
+        # This object.__setattr__ dance is the price of using eqx + dataclasses
         object.__setattr__(self, "cfg", cfg)
 
         a = cfg.a
         a_cc = a / jnp.sqrt(3.0)
 
-        # primitive vectors
+        # primitive real-space vectors
         a1 = jnp.array([a / 2.0, jnp.sqrt(3.0) * a / 2.0])
         a2 = jnp.array([-a / 2.0, jnp.sqrt(3.0) * a / 2.0])
         A = jnp.stack([a1, a2], axis=1)
 
-        # reciprocal lattice
+        # reciprocal lattice (the usual 2π A^{-1})
         B = 2.0 * jnp.pi * jnp.linalg.inv(A)
         b1, b2 = B[:, 0], B[:, 1]
 
-        # nearest neighbors (C3)
+        # nearest neighbors (C3 symmetric, length = a_cc)
         deltas = a_cc * jnp.array([
             [0.0, -1.0],
             [jnp.sqrt(3.0) / 2.0, 0.5],
             [-jnp.sqrt(3.0) / 2.0, 0.5],
         ])
 
-        # next-nearest neighbors (C3)
+        # next-nearest neighbors (C3 symmetric)
         nnn = a * jnp.array([
             [1.0, 0.0],
             [-1.0, 0.0],
@@ -119,6 +123,7 @@ class GrapheneModel(eqx.Module):
             [-0.5, jnp.sqrt(3.0) / 2.0],
         ])
 
+        # convert to Joules, because the universe insists on SI
         tJ = cfg.t_eV * eV_to_J
         tprimeJ = cfg.tprime_eV * eV_to_J
         massJ = cfg.mass_eV * eV_to_J
@@ -137,17 +142,22 @@ class GrapheneModel(eqx.Module):
 
     @property
     def vF_analytic(self):
+        # textbook v_F = (3/2) a_cc t / ħ
         return (1.5 * self.a_cc * self.tJ) / hbar
 
     def f_k(self, k):
+        # off-diagonal structure factor, the heart of the Dirac cone
         return -self.tJ * jnp.sum(jnp.exp(1j * (self.deltas @ k)))
 
     def eps_diag(self, k):
+        # diagonal term from t' (next-nearest neighbors)
+        # breaks particle-hole symmetry but does NOT open a gap
         if self.tprimeJ == 0.0:
             return 0.0
         return -self.tprimeJ * jnp.sum(jnp.cos(self.nnn @ k))
 
     def h_k(self, k):
+        # 2x2 Bloch Hamiltonian
         f = self.f_k(k)
         e = self.eps_diag(k)
         Δ = self.massJ
@@ -155,43 +165,61 @@ class GrapheneModel(eqx.Module):
                           [jnp.conj(f), e - Δ]], dtype=jnp.complex128)
 
     def energies(self, k):
+        # eigenvalues only; we’ve stared at these more than we’d like to admit
         return jnp.linalg.eigvalsh(self.h_k(k))
 
     def grad_f(self, k):
+        # gradient of f(k), used for analytic v_F
         phase = jnp.exp(1j * (self.deltas @ k))
         return -self.tJ * jnp.sum((1j * self.deltas) * phase[:, None], axis=0)
 
     def analytic_K(self):
+        # analytic K point for ideal graphene
         kx = 4.0 * jnp.pi / (3.0 * jnp.sqrt(3.0) * self.a_cc)
         return jnp.array([kx, 0.0])
 
     def analytic_Kprime(self):
+        # analytic K' point
         kx = -4.0 * jnp.pi / (3.0 * jnp.sqrt(3.0) * self.a_cc)
         return jnp.array([kx, 0.0])
 
 
 # ============================================================
 #  Berry phase from band eigenvectors (gauge-fixed, unwrapped)
+#  This part fought us. Hard.
 # ============================================================
 
 def berry_phase_band_loop(model: GrapheneModel, K, radius_rel, dirs, band_index=0):
+    """
+    Compute Berry phase along a small loop around K using eigenvectors.
+
+    We:
+    - walk on a circle in k-space,
+    - fix the phase of the first component at each point,
+    - accumulate overlaps,
+    - unwrap phase jumps to stay in [-π, π].
+
+    After several rounds of "why is this 4π instead of π", this is the version
+    that behaves like physics instead of chaos.
+    """
     a = model.cfg.a
     r = radius_rel / a
     angles = jnp.linspace(0.0, 2.0 * jnp.pi, int(dirs), endpoint=False)
     ks = K + r * jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=1)
 
     def eigvec(k):
+        # eigenvectors are only defined up to a phase; we pin that phase
         _, v = jnp.linalg.eigh(model.h_k(k))
         v = v[:, band_index]
         phase = jnp.angle(v[0])
         v = v * jnp.exp(-1j * phase)
-        v = jnp.where(jnp.real(v[0]) < 0, -v, v)
         return v
 
     vs = jax.vmap(eigvec)(ks)
 
     overlaps = jnp.sum(jnp.conj(vs[:-1]) * vs[1:], axis=1)
     dphi = jnp.angle(overlaps)
+    # unwrap to [-π, π] so we don't accumulate fake 2π jumps
     dphi = jnp.mod(dphi + jnp.pi, 2 * jnp.pi) - jnp.pi
 
     overlap_close = jnp.sum(jnp.conj(vs[-1]) * vs[0])
@@ -204,6 +232,7 @@ def berry_phase_band_loop(model: GrapheneModel, K, radius_rel, dirs, band_index=
 
 # ============================================================
 #  Symmetry helpers
+#  Little sanity checks that saved us from silent disasters
 # ============================================================
 
 def c3_rotation_matrix():
@@ -232,6 +261,7 @@ def audit_c3_invariance(f_k, b1, b2, samples=6, atol=REPORT_CFG.periodicity_atol
 
 
 def energies_with_tau(k, tau_shift, a1, a2, tJ, nnn, eps_diag_base, massJ):
+    # same physics, different choice of origin (tau shift)
     deltas_shift = jnp.stack([tau_shift, tau_shift - a1, tau_shift - a2], axis=0)
     phase = jnp.exp(1j * (deltas_shift @ k))
     f = -tJ * jnp.sum(phase)
@@ -260,6 +290,7 @@ def audit_tau_gauge_invariance(a1, a2, b1, b2, tJ, nnn, eps_diag_base, massJ, at
 
 # ============================================================
 #  Dirac auditor: vF, Berry, curvature, scaling
+#  This is where we turned paranoia into code
 # ============================================================
 
 class DiracAuditor(eqx.Module):
@@ -269,6 +300,12 @@ class DiracAuditor(eqx.Module):
     cfg: CoreAuditConfig = eqx.field(static=True)
 
     def newton_refine(self, k0):
+        """
+        Newton-Raphson refinement of the Dirac point.
+
+        We started from analytic K, but we don't trust anything blindly anymore,
+        so we solve f(k) = 0 numerically and let this converge.
+        """
         det_tol = self.cfg.det_tol
 
         def body(carry, _):
@@ -284,6 +321,7 @@ class DiracAuditor(eqx.Module):
                 return dk, jnp.minimum(alpha * 2.0, 1.0)
 
             def damp(_):
+                # when detJ is tiny, we back off instead of exploding
                 return jnp.zeros_like(k), alpha * 0.5
 
             dk, new_alpha = lax.cond(jnp.abs(detJ) >= det_tol, solve, damp, None)
@@ -298,6 +336,11 @@ class DiracAuditor(eqx.Module):
         return g_norm / (jnp.sqrt(2.0) * hbar)
 
     def vF_ring_at_q(self, K, q_rel):
+        """
+        Estimate v_F by finite differences on a ring around K.
+
+        This is the "let's see if the gradient story survives numerics" check.
+        """
         q_abs = q_rel / self.model.a_cc
         angles = jnp.linspace(0.0, 2.0 * jnp.pi, self.cfg.directions_ring, endpoint=False)
         us = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=1)
@@ -318,6 +361,11 @@ class DiracAuditor(eqx.Module):
         return self.vF_ring_at_q(K, self.cfg.q_rel_default)
 
     def berry_discrete(self, K, radius_rel, dirs):
+        """
+        Berry phase from arg f(k) winding.
+
+        This one behaved nicely from the start, unlike the eigenvector version.
+        """
         a = self.model.cfg.a
         r = radius_rel / a
         angles = jnp.linspace(0.0, 2.0 * jnp.pi, dirs, endpoint=False)
@@ -346,6 +394,12 @@ class DiracAuditor(eqx.Module):
         return results[idx], results
 
     def curvature(self, K):
+        """
+        Second derivative of the upper band at K along many directions.
+
+        In a perfect Dirac cone this should be ~0. We made sure it's not
+        "zero by accident" but actually below a physically meaningful floor.
+        """
         a = self.model.cfg.a
         h_rel = self.cfg.h_rel_default
         angles = jnp.linspace(0.0, 2.0 * jnp.pi, self.cfg.directions_curvature, endpoint=False)
@@ -368,6 +422,11 @@ class DiracAuditor(eqx.Module):
         return jnp.max(ks), jnp.max(es)
 
     def scaling_t(self):
+        """
+        Check v_F ∝ t by scanning t and fitting a line.
+
+        If this fails, something is deeply wrong with the model or our sanity.
+        """
         tJ0 = self.model.tJ
         a_cc = self.model.a_cc
         deltas = self.model.deltas
@@ -416,6 +475,11 @@ class DiracAuditor(eqx.Module):
         return c, r2, slope_theory
 
     def scaling_a(self):
+        """
+        Check v_F ∝ a by scanning lattice constant.
+
+        Another sanity check: if this breaks, we know where to cry.
+        """
         a0 = self.model.cfg.a
         tJ = self.model.tJ
         a_vals = jnp.linspace(0.5 * a0, 1.5 * a0, self.cfg.scaling_points)
@@ -470,6 +534,11 @@ class DiracAuditor(eqx.Module):
         return c, r2, slope_theory
 
     def linear_regime_radius(self, K):
+        """
+        Find how far in q we can go before v_F deviates too much.
+
+        This is basically asking: "how honest is the Dirac cone numerically?"
+        """
         vF_ref = self.vF_from_grad(K)
         qs_rel = jnp.array([1e-9, 5e-9, 1e-8, 5e-8, 1e-7, 1e-6, 5e-6, 1e-5])
 
@@ -483,26 +552,33 @@ class DiracAuditor(eqx.Module):
         return jnp.where(mask.any(), qs_rel[idx], 0.0)
 
     def run_core(self):
+        # Find Dirac points
         K = self.newton_refine(self.model.analytic_K())
         Kp = self.newton_refine(self.model.analytic_Kprime())
 
+        # Fermi velocities
         vf_grad_K = self.vF_from_grad(K)
         vf_grad_Kp = self.vF_from_grad(Kp)
         vf_fit_K, spread_K = self.vF_ring_fit(K)
         vf_fit_Kp, spread_Kp = self.vF_ring_fit(Kp)
 
+        # Berry from f(k)
         (gK, wK, rK, nK), _ = self.berry_adaptive(K)
         (gKp, wKp, rKp, nKp), _ = self.berry_adaptive(Kp)
 
+        # Berry from eigenvectors
         gamma_band_K = berry_phase_band_loop(self.model, K, rK, int(nK), band_index=0)
         gamma_band_Kp = berry_phase_band_loop(self.model, Kp, rKp, int(nKp), band_index=0)
 
+        # Curvature
         curvK, errK = self.curvature(K)
         curvKp, errKp = self.curvature(Kp)
 
+        # Scaling
         slope_t, R2_t, slope_t_theory = self.scaling_t()
         slope_a, R2_a, slope_a_theory = self.scaling_a()
 
+        # Linear regime
         linR_K = self.linear_regime_radius(K)
         linR_Kp = self.linear_regime_radius(Kp)
 
@@ -539,6 +615,7 @@ def format_float(x):
 
 # ============================================================
 #  Full audit
+#  The big “is this thing physically honest?” button
 # ============================================================
 
 def run_full_audit(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.1):
@@ -559,6 +636,7 @@ def run_full_audit(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.1):
     deltas = model.deltas
     nnn = model.nnn
 
+    # nearest-neighbor sanity
     delta_lengths = jnp.linalg.norm(deltas, axis=1)
     delta_ok = bool(jnp.allclose(delta_lengths, a_cc, atol=1e-14))
 
@@ -602,6 +680,7 @@ def run_full_audit(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.1):
     linR_K = float(core["linear_radius_K"])
     linR_Kp = float(core["linear_radius_Kp"])
 
+    # Assertions: the part where we refuse to accept quiet nonsense
     assert delta_ok, "Nearest-neighbor lengths do not match a_cc."
     assert hermiticity, "Hamiltonian is not Hermitian."
     assert periodic_b1 and periodic_b2, "Bloch periodicity failed."
@@ -610,6 +689,7 @@ def run_full_audit(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.1):
     assert tau_ok, "Tau gauge invariance failed."
 
     if massJ != 0.0:
+        # massive Dirac: gap should be 2Δ at K
         def E_plus(k): return jnp.max(model.energies(k))
         def E_minus(k): return jnp.min(model.energies(k))
 
@@ -694,6 +774,7 @@ def run_full_audit(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.1):
 
 # ============================================================
 #  Extra diagnostics
+#  These are the “show me the numbers” helpers
 # ============================================================
 
 def vf_ring_diagnostics():
@@ -737,10 +818,107 @@ def linear_regime_debug():
 
 
 # ============================================================
+#  “Answering the criticism” tests
+#  These are literally us arguing with our own doubts
+# ============================================================
+
+def berry_massless_radius_sweep():
+    """
+    Test 1: massless case, Berry phase vs radius.
+
+    We know eigenvectors are ill-defined exactly at the Dirac point.
+    This sweep shows how gamma_band behaves as we move the loop radius.
+    """
+    print("=== Berry eigenvector vs radius (massless) ===")
+    cfg = GrapheneConfig(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.0)
+    model = GrapheneModel(cfg)
+    auditor = DiracAuditor(model, CoreAuditConfig())
+    K = auditor.newton_refine(model.analytic_K())
+
+    radii = jnp.array([1e-10, 5e-10, 1e-9, 5e-9, 1e-8])
+    dirs = 256
+
+    for r in radii:
+        gamma_band = float(berry_phase_band_loop(model, K, r, int(dirs), band_index=0))
+        gamma_f, wind = auditor.berry_discrete(K, r, int(dirs))
+        print(
+            f"radius_rel={r:.1e} -> "
+            f"gamma_band={gamma_band:.6f}, "
+            f"gamma_f={float(gamma_f):.6f}, "
+            f"winding={float(wind):.6f}"
+        )
+
+
+def tprime_dirac_energy_scan():
+    """
+    Test 2: scan t' and check Dirac energy & gap.
+
+    t' should shift the Dirac point energy but must NOT open a gap
+    as long as the mass term is zero.
+    """
+    print("\n=== t' scan: Dirac energy & gap (massless) ===")
+    a = 2.46e-10
+    t_eV = 2.8
+    tprimes = jnp.array([0.0, 0.1, 0.2, 0.3])
+
+    for tp in tprimes:
+        cfg = GrapheneConfig(a=a, t_eV=t_eV, tprime_eV=float(tp), mass_eV=0.0)
+        model = GrapheneModel(cfg)
+        auditor = DiracAuditor(model, CoreAuditConfig())
+        K = auditor.newton_refine(model.analytic_K())
+
+        E = model.energies(K)
+        E_min = float(jnp.min(E))
+        E_max = float(jnp.max(E))
+        gap = E_max - E_min
+
+        print(
+            f"t'={float(tp):.2f} eV -> "
+            f"E_min={E_min/eV_to_J:.6f} eV, "
+            f"E_max={E_max/eV_to_J:.6f} eV, "
+            f"gap={gap/eV_to_J:.6e} eV"
+        )
+
+
+def newton_refine_drift():
+    """
+    Test 3: how far does Newton refinement move from analytic K?
+
+    In the ideal case, the drift is tiny. But this test is here
+    for the day we start deforming the lattice and want to see
+    how much the Dirac point actually shifts.
+    """
+    print("\n=== Newton refine drift from analytic K ===")
+    cfg = GrapheneConfig(a=2.46e-10, t_eV=2.8, tprime_eV=0.0, mass_eV=0.0)
+    model = GrapheneModel(cfg)
+    auditor = DiracAuditor(model, CoreAuditConfig())
+
+    K_analytic = model.analytic_K()
+    K_refined = auditor.newton_refine(K_analytic)
+
+    dK = K_refined - K_analytic
+    print(f"K_analytic = ({float(K_analytic[0]):.6e}, {float(K_analytic[1]):.6e})")
+    print(f"K_refined  = ({float(K_refined[0]):.6e}, {float(K_refined[1]):.6e})")
+    print(f"|ΔK|       = {float(jnp.linalg.norm(dK)):.6e} 1/m")
+
+
+# ============================================================
 #  Main
+#  This is the “run everything and see if it screams” entry point
 # ============================================================
 
 if __name__ == "__main__":
+    # Core audit: massive Dirac, full symmetry & scaling checks
     core = run_full_audit(mass_eV=0.1)
+
+    # Extra diagnostics for v_F and linear regime
     vf_ring_diagnostics()
     linear_regime_debug()
+
+    # “Answer the criticism” tests:
+    # 1) massless Berry vs radius
+    # 2) t' only shifts energy, no gap
+    # 3) Newton refinement drift from analytic K
+    berry_massless_radius_sweep()
+    tprime_dirac_energy_scan()
+    newton_refine_drift()
